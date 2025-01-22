@@ -1,0 +1,64 @@
+import yfinance as yf
+import pandas as pd
+
+def fetch_financial_metrics(tickers):
+    """
+    Fetches financial metrics for given tickers from Yahoo Finance.
+    
+    Args:
+        tickers (list): List of stock tickers.
+    
+    Returns:
+        DataFrame: DataFrame containing the financial metrics.
+    """
+    metrics = []
+
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+
+            metrics.append({
+                "Ticker": ticker,
+                "P/E Ratio": info.get("trailingPE"),
+                "Dividend Yield (%)": info.get("dividendYield") * 100 if info.get("dividendYield") else None,
+                "Revenue Growth (%)": info.get("revenueGrowth") * 100 if info.get("revenueGrowth") else None,
+                "Operating Margins (%)": info.get("operatingMargins") * 100 if info.get("operatingMargins") else None,
+                "Free Cash Flow (TTM)": info.get("freeCashflow"),
+                "Payout Ratio (%)": info.get("payoutRatio") * 100 if info.get("payoutRatio") else None,
+                "EPS (Earnings Per Share)": info.get("trailingEps"),
+            })
+        except Exception as e:
+            print(f"Error fetching data for {ticker}: {e}")
+
+    # Convert to DataFrame
+    df = pd.DataFrame(metrics)
+    return df
+
+
+def main():
+    print("Welcome to Yahoo Finance Metrics Fetcher!")
+    print("You can input as many tickers as you want, separated by commas.")
+    tickers_input = input("Enter the stock tickers (comma-separated, e.g., AAPL, MSFT, TSLA): ")
+    tickers = [ticker.strip().upper() for ticker in tickers_input.split(",")]
+
+    # Fetch metrics
+    metrics_df = fetch_financial_metrics(tickers)
+    
+    # Display results
+    print("\nFinancial Metrics:")
+    print(metrics_df)
+
+    # Save to Excel
+    save_option = input("\nDo you want to save the results to an Excel file? (yes/no): ").strip().lower()
+    if save_option == "yes":
+        filename = input("Enter the filename (e.g., metrics.xlsx): ").strip()
+        # Add .xlsx if it's not present
+        if not filename.endswith(('.xlsx', '.xls')):
+            filename += '.xlsx' 
+        metrics_df.to_excel(filename, index=False)
+        print(f"Data saved to {filename}")
+
+
+if __name__ == "__main__":
+    main()
