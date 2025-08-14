@@ -1,0 +1,243 @@
+// bridge.js
+const express = require('express');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+puppeteer.use(StealthPlugin()); // This is KEY
+
+const app = express();
+const PORT = 5000;
+
+const wss = new WebSocket.Server({ noServer: true });
+let latestSignal = null;
+let browser = null;
+let page = null;
+
+// Configuration
+const TV_USERNAME = 'Page_Swing';
+const TV_PASSWORD = 'Page_swing_@08';
+const CHART_URL = 'https://www.tradingview.com/chart/qXwMda7s/?symbol=NASDAQ%3AQQQ';
+const SYMBOL = 'INVESCO QQQ TRUST, SERIES 1';
+
+// === Express Routes ===
+app.get('/health', (req, res) => {
+  res.json({ status: 'running', latestSignal, connections: wss.clients.size });
+});
+
+app.post('/trigger-signal', (req, res) => {
+  const testSignal = { type: 'manual', signal: 'LONG', symbol: SYMBOL, time: new Date().toISOString() };
+  wss.clients.forEach(client => client.readyState === WebSocket.OPEN && client.send(JSON.stringify(testSignal)));
+  res.json({ message: 'Test signal sent' });
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`✅ Bridge running at ws://localhost:${PORT}`);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+});
+
+wss.on('connection', ws => {
+  console.log('🟢 New WebSocket client connected');
+  if (latestSignal) ws.send(JSON.stringify(latestSignal));
+});
+
+// === Signal Detection ===
+async function detectCobraSignals() {
+  try {
+    return await page.evaluate(() => {
+      const results = [];
+
+      // Text signals
+      const texts = Array.from(document.querySelectorAll('text, div, span')).filter(el => {
+        const txt = (el.textContent || '').toUpperCase();
+        return txt.includes('LONG') || txt.includes('SHORT') || txt.includes('BUY') || txt.includes('SELL');
+      });
+
+      texts.forEach(el => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 5 && rect.height > 5) {
+          results.push({ type: 'text', text: el.textContent.trim(), x: rect.x, y: rect.y });
+        }
+      });
+
+      // Shapes (green/red)
+      const shapes = Array.from(document.querySelectorAll('path, rect, circle')).filter(el => {
+        const fill = (el.getAttribute('fill') || '').toLowerCase();
+        const stroke = (el.getAttribute('stroke') || '').toLowerCase();
+        return fill.includes('green') || fill.includes('#00ff00') || fill.includes('red') || fill.includes('#ff0000');
+      });
+
+      shapes.forEach(el => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 5 && rect.height > 5) {
+          results.push({ type: 'shape', fill, stroke: el.getAttribute('stroke') });
+        }
+      });
+
+      return results;
+    });
+  } catch (e) {
+    console.error('Signal detection error:', e.message);
+    return [];
+  }
+}
+
+// === Monitor Signals ===
+async function monitorSignals() {
+  let lastCount = 0;
+  setInterval(async () => {
+    try {
+      const signals = await detectCobraSignals();
+      if (signals.length > lastCount || JSON.stringify(signals) !== JSON.stringify(latestSignal?.signals)) {
+        latestSignal = {
+          symbol: SYMBOL,
+          signals,
+          count: signals.length,
+          time: new Date().toISOString(),
+        };
+        console.log('🔔 SIGNAL:', latestSignal);
+        wss.clients.forEach(client => client.readyState === WebSocket.OPEN && client.send(JSON.stringify(latestSignal)));
+      }
+      lastCount = signals.length;
+    } catch (e) { console.error('Monitoring error:', e.message); }
+  }, 6000);
+}
+
+// === Launch Browser with Maximum Stealth ===
+async function launchBrowser() {
+  return await puppeteer.launch({
+    headless: false,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-infobars',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-web-security',
+      '--allow-running-insecure-content',
+      '--disable-extensions',
+      '--start-maximized',
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      '--window-position=0,0',
+    ],
+    defaultViewport: null,
+    userDataDir: './tradingview_profile', // Save session
+    timeout: 60000,
+  });
+}
+
+// === Login Logic with Multiple Selector Fallbacks ===
+async function loginToTradingView(page) {
+  console.log('🌐 Navigating to login page...');
+  await page.goto('https://www.tradingview.com/accounts/signin/', {
+    waitUntil: 'networkidle2',
+    timeout: 60000,
+  });
+
+  // Wait up to 30 seconds for any login-related input
+  console.log('⏳ Waiting for login fields (this may take time)...');
+
+  try {
+    await page.waitForFunction(() => {
+      const inputs = Array.from(document.querySelectorAll('input'));
+      return inputs.some(input => ['username', 'email', 'text'].includes(input.getAttribute('name')));
+    }, { timeout: 30000 });
+
+    console.log('🎯 Login inputs detected');
+
+    // Try multiple selectors
+    const selectors = [
+      'input[name="username"]',
+      'input[autocomplete="username"]',
+      'input[type="text"]',
+      '#id_username'
+    ];
+
+    let usernameInput = null;
+    for (const sel of selectors) {
+      usernameInput = await page.$(sel);
+      if (usernameInput) {
+        await page.type(sel, TV_USERNAME, { delay: 100 });
+        break;
+      }
+    }
+    if (!usernameInput) throw new Error('No username input found');
+
+    await page.type('input[name="password"], input[autocomplete="current-password"], input[type="password"]', TV_PASSWORD, { delay: 100 });
+
+    // Click any submit button
+    await Promise.all([
+      page.click('button[type="submit"]'),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {})
+    ]);
+
+    console.log('✅ Submitted login');
+    await page.waitForTimeout(5000);
+  } catch (err) {
+    console.warn('⚠️ Login automation failed. Please log in MANUALLY in the browser.');
+    console.warn('After logging in, go to your chart:', CHART_URL);
+    console.warn('Then press [Enter] here to continue...');
+    await new Promise(r => {
+      process.stdin.resume();
+      process.stdin.once('data', () => r());
+    });
+  }
+}
+
+// === Main Function ===
+async function startBot() {
+  let attempts = 0;
+  while (attempts < 10) {
+    try {
+      browser = await launchBrowser();
+      page = await browser.newPage();
+
+      // Extra stealth
+      await page.evaluateOnNewDocument(() => {
+        delete navigator.__proto__.webdriver;
+        window.chrome = { runtime: {} };
+      });
+
+      await loginToTradingView(page);
+
+      // Final check: is user logged in?
+      await page.goto('https://www.tradingview.com/chart/', { waitUntil: 'networkidle2' });
+      await page.waitForTimeout(5000);
+
+      // If still on login page, fail
+      const isLoggedIn = await page.$('a[href*="/profiles/"]') !== null;
+      if (!isLoggedIn) {
+        console.warn('❌ Not logged in. Retrying...');
+        throw new Error('Login failed');
+      }
+
+      console.log('✅ Logged in! Loading chart...');
+      await page.goto(CHART_URL, { waitUntil: 'networkidle2' });
+      await page.waitForTimeout(15000); // Let chart load
+
+      monitorSignals();
+      return;
+    } catch (error) {
+      attempts++;
+      console.error(`❌ Attempt ${attempts} failed:`, error.message);
+      if (browser) await browser.close();
+      if (attempts >= 10) break;
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+
+  console.error('❌ Max retries reached. Please check internet, credentials, or login manually.');
+  process.exit(1);
+}
+
+// === Graceful Shutdown ===
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down...');
+  if (browser) await browser.close();
+  process.exit(0);
+});
+
+// === Start ===
+startBot().catch(console.error);
