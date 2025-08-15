@@ -1,0 +1,245 @@
+// bridge.js
+const express = require('express');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+puppeteer.use(StealthPlugin());
+
+const app = express();
+const PORT = 5000;
+
+const wss = new WebSocket.Server({ noServer: true });
+let latestSignal = null;
+let browser = null;
+let pages = {
+  cobra: null,
+  lux: null,
+  execution: null // Separate page for execution
+};
+
+// === CONFIGURATION ===
+const COBRA_CHART_URL = 'https://www.tradingview.com/chart/qXwMda7s/';
+const LUX_CHART_URL = 'https://www.tradingview.com/chart/s3Nn7W4r/';
+const EXECUTION_CHART_URL = 'https://www.tradingview.com/chart/s5dLDbB6/'; // Your execution chart
+const SYMBOL = 'NASDAQ 100 E-mini Futures';
+const CONFIRMATION_WINDOW_MS = 3 * 1000; // 3 seconds
+
+// === TRACK LAST COBRA SHORT TIME ===
+let lastCobraShortTime = null;
+
+// === EXPRESS SERVER ===
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'running',
+    latestSignal,
+    connections: wss.clients.size,
+    lastCobraShortTime,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+wss.on('connection', (ws) => {
+  console.log('🟢 New WebSocket client connected');
+  if (latestSignal) ws.send(JSON.stringify(latestSignal));
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`✅ Bridge running at ws://localhost:${PORT}`);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+// === SIGNAL DETECTION ===
+
+// 🟢 Cobra Algo Signal Detection
+async function detectCobraSignals(page) {
+  return await page.evaluate(() => {
+    const results = [];
+    const textElements = Array.from(document.querySelectorAll('text'))
+      .filter(el => {
+        const txt = (el.textContent || '').trim().toUpperCase();
+        return txt.includes('SHORT') || txt.includes('SELL');
+      });
+
+    textElements.forEach(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        results.push({
+          type: 'text',
+          content: el.textContent.trim(),
+          x: rect.x,
+          y: rect.y,
+        });
+      }
+    });
+
+    return results.length ? { type: 'cobra', signals: results } : null;
+  });
+}
+
+// 🔵 Lux Algo Signal Detection
+async function detectLuxSignals(page) {
+  return await page.evaluate(() => {
+    const results = [];
+    const textElements = Array.from(document.querySelectorAll('text'))
+      .filter(el => {
+        const txt = (el.textContent || '').trim().toUpperCase();
+        return txt.includes('LONG') || txt.includes('BUY');
+      });
+
+    textElements.forEach(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        results.push({
+          type: 'text',
+          content: el.textContent.trim(),
+          x: rect.x,
+          y: rect.y,
+        });
+      }
+    });
+
+    return results.length ? { type: 'lux', signals: results } : null;
+  });
+}
+
+// 🟣 Combine Signals with Time Window (Cobra Short → Lux Long within 3s)
+function checkTimeBasedConfluence(cobraSignals, luxSignals) {
+  const now = Date.now();
+
+  // Look for new Cobra SHORT
+  const hasCobraShort = cobraSignals?.signals.some(s =>
+    ['SHORT', 'SELL'].includes(s.content.toUpperCase())
+  );
+
+  if (hasCobraShort) {
+    lastCobraShortTime = now;
+    console.log('📌 Cobra SHORT detected at:', new Date(now).toISOString());
+  }
+
+  // Look for Lux LONG
+  const hasLuxLong = luxSignals?.signals.some(s =>
+    ['LONG', 'BUY'].includes(s.content.toUpperCase())
+  );
+
+  if (hasLuxLong && lastCobraShortTime) {
+    const timeDiff = now - lastCobraShortTime;
+
+    if (timeDiff <= CONFIRMATION_WINDOW_MS) {
+      return {
+        action: 'TRIGGER_LONG',
+        reason: `Cobra Short → Lux Long within ${Math.floor(timeDiff / 1000)}s`,
+        cobraTime: new Date(lastCobraShortTime).toISOString(),
+        luxTime: new Date(now).toISOString(),
+        timestamp: new Date().toISOString(),
+      };
+    } else {
+      console.log(`❌ Lux Long too late: ${timeDiff / 1000}s after Cobra (window: 3s)`);
+    }
+  }
+
+  return null;
+}
+
+// === EXECUTION ===
+async function executeSignal(signal) {
+  if (!pages.execution) return;
+  
+  try {
+    console.log('🚀 Executing signal on execution chart...');
+    await pages.execution.bringToFront();
+    
+    // Here you would add code to interact with the execution chart
+    // For example, placing orders or drawing markers
+    
+    console.log('✅ Signal executed:', signal);
+  } catch (error) {
+    console.error('Execution failed:', error.message);
+  }
+}
+
+// === MONITORING ===
+async function startMonitoring() {
+  setInterval(async () => {
+    try {
+      const cobraSignals = await detectCobraSignals(pages.cobra);
+      const luxSignals = await detectLuxSignals(pages.lux);
+
+      const combinedSignal = checkTimeBasedConfluence(cobraSignals, luxSignals);
+
+      if (combinedSignal) {
+        console.log('🚀 HIGH-CONFIDENCE SIGNAL:', combinedSignal);
+        latestSignal = combinedSignal;
+
+        // Execute on the separate chart
+        await executeSignal(combinedSignal);
+
+        // Broadcast to WebSocket clients
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(combinedSignal));
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Error in signal monitoring:', error.message);
+    }
+  }, 1000); // Check every second for more precise timing
+}
+
+// === LAUNCH BROWSER AND CHARTS ===
+async function launchBrowserAndCharts() {
+  try {
+    console.log('🚀 Launching browser...');
+    browser = await puppeteer.launch({
+      headless: false,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--start-maximized',
+        '--window-position=0,0'
+      ],
+      defaultViewport: null,
+      userDataDir: './tradingview_session',
+    });
+
+    // Launch Cobra chart
+    pages.cobra = await browser.newPage();
+    await pages.cobra.goto(COBRA_CHART_URL, { waitUntil: 'networkidle2' });
+    await pages.cobra.waitForTimeout(10000);
+    console.log('✅ Cobra chart loaded');
+
+    // Launch Lux chart
+    pages.lux = await browser.newPage();
+    await pages.lux.goto(LUX_CHART_URL, { waitUntil: 'networkidle2' });
+    await pages.lux.waitForTimeout(10000);
+    console.log('✅ Lux chart loaded');
+
+    // Launch Execution chart
+    pages.execution = await browser.newPage();
+    await pages.execution.goto(EXECUTION_CHART_URL, { waitUntil: 'networkidle2' });
+    await pages.execution.waitForTimeout(10000);
+    console.log('✅ Execution chart loaded');
+
+    console.log('✅ All charts loaded. Starting signal monitoring...');
+    startMonitoring();
+  } catch (error) {
+    console.error('❌ Startup failed:', error.message);
+    setTimeout(launchBrowserAndCharts, 10000);
+  }
+}
+
+// === SHUTDOWN ===
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down...');
+  if (browser) await browser.close();
+  process.exit(0);
+});
+
+// === START ===
+launchBrowserAndCharts();
