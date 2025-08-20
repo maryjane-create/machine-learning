@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Real-Time TradingView Email Alert Listener
+------------------------------------------
+✅ Connects to Gmail via IMAP
+✅ Uses IDLE (push notifications) for real-time alerts
+✅ Extracts subject, sender, and body
+✅ Matches TradingView alert patterns
+✅ Runs continuously until stopped
+"""
+
+import logging
+from imapclient import IMAPClient
+import email
+import re
+from datetime import datetime
+import time
+
+# === CONFIGURATION ===
+# NOTE: For Gmail, you must use an App Password, not your regular password.
+# See: https://support.google.com/accounts/answer/185833
+CONFIG = {
+    "email_server": "imap.gmail.com",
+    "email_port": 993,
+    "email_user": "maryjaneokoroafor77@gmail.com",
+    "email_pass": "yrdj ojqq zalv prwh",
+    "mailbox": "INBOX",
+}
+
+# === LOGGING SETUP ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("tradingview_alerts.log"),  # save to file
+        logging.StreamHandler()                          # print to console
+    ]
+)
+
+def extract_body(email_message):
+    """Extract plain text body from an email message."""
+    body = ""
+    # Walk through the email parts to find the text/plain content.
+    if email_message.is_multipart():
+        for part in email_message.walk():
+            # Only process text/plain parts
+            if part.get_content_type() == "text/plain":
+                try:
+                    # Decode the payload. The 'errors="ignore"' handles potential decoding issues.
+                    body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    break  # Found the body, no need to continue
+                except Exception:
+                    continue
+    else:
+        # For non-multipart emails, just get the payload directly.
+        try:
+            body = email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
+        except Exception:
+            body = str(email_message.get_payload())
+    return body
+
+def process_email(imap, msg_id):
+    """Fetch and process a single email message."""
+    try:
+        # Fetch the email data using its UID.
+        response = imap.fetch([msg_id], ["RFC822"])
+        email_data = response[msg_id][b"RFC822"]
+        email_message = email.message_from_bytes(email_data)
+
+        # Extract message details
+        subject = email_message.get("Subject", "No Subject")
+        sender = email_message.get("From", "Unknown")
+        body = extract_body(email_message)
+
+        # Log email details
+        logging.info("\n📧 New TradingView Alert!")
+        logging.info(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"From: {sender}")
+        logging.info(f"Subject: {subject}")
+        logging.info(f"Body preview: {body[:300]}...")
+
+        # === PATTERN MATCHING ===
+        # Define a list of regex patterns to match against the email body.
+        patterns = [
+            r'LuxAlgo(\d+)\s+(Bullish|Bearish|Neutral)',
+            r'(LuxAlgo18|LuxAlgo25|LuxAlgo12)\s+signal:\s+(Buy|Sell|Neutral)',
+            r'Alert:\s+(.+?)\s+-\s+(.+?)\s+\((Bullish|Bearish)\)',
+            r'Cobra Algo\s+(Buy|Sell)\s+Alert',
+        ]
+
+        logging.info("\n🎯 Pattern matching results:")
+        matched_any = False
+        for i, pattern in enumerate(patterns, 1):
+            match = re.search(pattern, body, re.IGNORECASE)
+            if match:
+                # Log if a pattern is matched
+                logging.info(f"  ✅ Pattern {i} matched: {match.groups()}")
+                matched_any = True
+            else:
+                logging.info(f"  ❌ Pattern {i} no match")
+
+        if not matched_any:
+            logging.info("⚠️ No known pattern matched this email.\n")
+
+    except Exception as e:
+        logging.error(f"Error processing message {msg_id}: {e}")
+    finally:
+        # Mark the message as seen to avoid reprocessing.
+        imap.add_flags([msg_id], ['\\Seen'])
+
+def check_for_new_alerts(imap):
+    """
+    Search for and process new unseen emails from TradingView.
+    This function is called periodically to catch any new messages.
+    """
+    try:
+        # Search for unseen messages from 'TradingView' or with 'Alert' in the subject.
+        # Use UID search for a more robust and reliable approach.
+        email_ids = imap.search(['UNSEEN', 'FROM', 'TradingView', 'SUBJECT', 'Alert'])
+        
+        if email_ids:
+            logging.info(f"Found {len(email_ids)} new email(s).")
+            # Iterate through the message UIDs and process each one.
+            for msg_id in email_ids:
+                process_email(imap, msg_id)
+        else:
+            logging.info("No new TradingView alerts found.")
+    except Exception as e:
+        logging.error(f"Error checking for new alerts: {e}")
+
+def main():
+    print("🚀 Starting TradingView Real-Time Alert Listener")
+    print("=" * 60)
+
+    try:
+        # Connect to the IMAP server securely.
+        with IMAPClient(CONFIG["email_server"], port=CONFIG["email_port"], ssl=True) as imap:
+            imap.login(CONFIG["email_user"], CONFIG["email_pass"])
+            logging.info("✅ Logged in successfully.")
+
+            # Select the mailbox to monitor.
+            imap.select_folder(CONFIG["mailbox"])
+            logging.info(f"✅ Selected mailbox: {CONFIG['mailbox']}")
+            
+            # Initially check for any alerts that arrived while the script was offline.
+            check_for_new_alerts(imap)
+            
+            if imap.has_capability("IDLE"):
+                logging.info("✅ Server supports IMAP IDLE. Entering real-time mode...")
+                print("\nPress Ctrl+C to stop the listener.")
+                
+                # Use a while loop to continuously check for new emails using IDLE.
+                while True:
+                    try:
+                        # Enter IDLE state and wait for a response.
+                        logging.info("⏳ Waiting for new alerts (IDLE mode)...")
+                        imap.idle()
+                        
+                        # Wait for up to 60 seconds for new mail.
+                        # If a new email arrives, idle_check will return immediately.
+                        responses = imap.idle_check(timeout=60)
+                        
+                        if responses:
+                            # A new message event was received. Exit IDLE mode to process.
+                            imap.idle_done()
+                            logging.info("🔔 New message event received. Processing...")
+                            check_for_new_alerts(imap)
+                        else:
+                            # If no messages in 60s, exit IDLE mode to keep the connection alive.
+                            imap.idle_done()
+                            logging.info("Timeout. Keeping connection alive...")
+                            time.sleep(1) # Small delay before re-entering IDLE
+                            
+                    except KeyboardInterrupt:
+                        logging.info("\n🛑 Exiting IDLE mode...")
+                        imap.idle_done()
+                        break
+                    except Exception as e:
+                        logging.error(f"Error during IDLE loop, restarting: {e}")
+                        time.sleep(5)  # Wait before retrying to prevent rapid failures
+
+            else:
+                logging.warning("⚠️ IMAP IDLE not supported. Falling back to polling every 60 seconds.")
+                while True:
+                    check_for_new_alerts(imap)
+                    time.sleep(60)
+
+    except KeyboardInterrupt:
+        logging.info("\n🛑 Stopping listener...")
+    except Exception as e:
+        logging.critical(f"A fatal error occurred: {e}")
+    finally:
+        logging.info("Script has stopped.")
+
+
+if __name__ == "__main__":
+    main()
