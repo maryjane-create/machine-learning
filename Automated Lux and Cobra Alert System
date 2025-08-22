@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+Real-Time TradingView Email Alert Listener with Sequential Pattern Detection
+----------------------------------------------------------------------------
+✅ Connects to Gmail via IMAP
+✅ Uses IDLE (push notifications) for real-time alerts
+✅ Extracts subject, sender, and body
+✅ Matches TradingView alert patterns
+✅ Detects LuxAlgo after Cobra Algo sequence
+✅ Sends email alerts when pattern sequence is detected
+✅ Runs continuously until stopped
+"""
+
+import logging
+from imapclient import IMAPClient
+import email
+import re
+from datetime import datetime, timedelta
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from collections import deque
+import json
+
+# === CONFIGURATION ===
+# NOTE: For Gmail, you must use an App Password, not your regular password.
+# See: https://support.google.com/accounts/answer/185833
+CONFIG = {
+    "email_server": "imap.gmail.com",
+    "email_port": 993,
+    "email_user": "maryjaneokoroafor77@gmail.com",
+    "email_pass": "yrdj ojqq zalv prwh",
+    "mailbox": "INBOX",
+    
+    # SMTP Configuration for sending alerts
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "alert_recipient": "maryjaneokoroafor77@gmail.com",  # Where to send sequence alerts
+    
+    # Sequence Detection Settings
+    "sequence_window_minutes": 30,  # Look for LuxAlgo within 30 minutes after Cobra
+    "max_alert_history": 100,       # Keep last 100 alerts in memory
+}
+
+# === GLOBAL STATE ===
+# Store recent alerts to detect sequences
+alert_history = deque(maxlen=CONFIG["max_alert_history"])
+
+# === LOGGING SETUP ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("tradingview_alerts.log"),  # save to file
+        logging.StreamHandler()                          # print to console
+    ]
+)
+
+class AlertPattern:
+    """Class to represent a detected alert pattern"""
+    def __init__(self, timestamp, alert_type, signal_direction, raw_text, symbol=None):
+        self.timestamp = timestamp
+        self.alert_type = alert_type  # 'cobra' or 'luxalgo'
+        self.signal_direction = signal_direction  # 'buy', 'sell', 'bullish', 'bearish', etc.
+        self.raw_text = raw_text
+        self.symbol = symbol
+
+    def to_dict(self):
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'alert_type': self.alert_type,
+            'signal_direction': self.signal_direction,
+            'raw_text': self.raw_text,
+            'symbol': self.symbol
+        }
+
+def send_email_alert(subject, body, recipient=None):
+    """Send an email alert using SMTP"""
+    if recipient is None:
+        recipient = CONFIG["alert_recipient"]
+    
+    try:
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = CONFIG["email_user"]
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        
+        # Add body to email
+        msg.attach(MIMEText(body, 'html'))
+        
+        # Create SMTP session
+        with smtplib.SMTP(CONFIG["smtp_server"], CONFIG["smtp_port"]) as server:
+            server.starttls()  # Enable TLS encryption
+            server.login(CONFIG["email_user"], CONFIG["email_pass"])
+            
+            # Send email
+            text = msg.as_string()
+            server.sendmail(CONFIG["email_user"], recipient, text)
+            
+        logging.info(f"✅ Email alert sent successfully to {recipient}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to send email alert: {e}")
+        return False
+
+def check_sequence_pattern():
+    """Check if LuxAlgo alert occurred after Cobra Algo within the specified time window"""
+    current_time = datetime.now()
+    sequence_window = timedelta(minutes=CONFIG["sequence_window_minutes"])
+    
+    # Look for recent LuxAlgo alerts (within last 5 minutes to catch fresh ones)
+    recent_luxalgo = [alert for alert in alert_history 
+                     if alert.alert_type == 'luxalgo' 
+                     and (current_time - alert.timestamp) < timedelta(minutes=5)]
+    
+    if not recent_luxalgo:
+        return False
+    
+    # For each recent LuxAlgo alert, check if there's a preceding Cobra alert
+    for luxalgo_alert in recent_luxalgo:
+        # Look for Cobra alerts that occurred before this LuxAlgo alert within the time window
+        cobra_alerts = [alert for alert in alert_history 
+                       if alert.alert_type == 'cobra' 
+                       and alert.timestamp < luxalgo_alert.timestamp 
+                       and (luxalgo_alert.timestamp - alert.timestamp) < sequence_window]
+        
+        if cobra_alerts:
+            # Found a sequence! Get the most recent Cobra alert
+            latest_cobra = max(cobra_alerts, key=lambda x: x.timestamp)
+            
+            # Create detailed alert message
+            time_diff = luxalgo_alert.timestamp - latest_cobra.timestamp
+            
+            subject = "🚨 SEQUENCE ALERT: LuxAlgo after Cobra Algo Detected!"
+            
+            body = f"""
+            <html>
+            <body>
+                <h2 style="color: #e74c3c;">🚨 Trading Sequence Alert Detected!</h2>
+                
+                <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 10px 0;">
+                    <h3 style="color: #2c3e50;">Sequence Pattern:</h3>
+                    <p><strong>Cobra Algo → LuxAlgo</strong> within {CONFIG['sequence_window_minutes']} minutes</p>
+                </div>
+                
+                <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                    <h4 style="color: #856404;">🐍 Cobra Algo Alert:</h4>
+                    <ul>
+                        <li><strong>Time:</strong> {latest_cobra.timestamp.strftime('%Y-%m-%d %H:%M:%S')}</li>
+                        <li><strong>Signal:</strong> {latest_cobra.signal_direction.upper()}</li>
+                        <li><strong>Symbol:</strong> {latest_cobra.symbol or 'N/A'}</li>
+                        <li><strong>Raw Text:</strong> {latest_cobra.raw_text[:200]}...</li>
+                    </ul>
+                </div>
+                
+                <div style="background-color: #d1ecf1; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                    <h4 style="color: #0c5460;">💎 LuxAlgo Alert:</h4>
+                    <ul>
+                        <li><strong>Time:</strong> {luxalgo_alert.timestamp.strftime('%Y-%m-%d %H:%M:%S')}</li>
+                        <li><strong>Signal:</strong> {luxalgo_alert.signal_direction.upper()}</li>
+                        <li><strong>Symbol:</strong> {luxalgo_alert.symbol or 'N/A'}</li>
+                        <li><strong>Raw Text:</strong> {luxalgo_alert.raw_text[:200]}...</li>
+                    </ul>
+                </div>
+                
+                <div style="background-color: #d4edda; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                    <h4 style="color: #155724;">⏱️ Timing Analysis:</h4>
+                    <ul>
+                        <li><strong>Time Between Alerts:</strong> {str(time_diff).split('.')[0]}</li>
+                        <li><strong>Pattern Window:</strong> {CONFIG['sequence_window_minutes']} minutes</li>
+                        <li><strong>Detection Time:</strong> {current_time.strftime('%Y-%m-%d %H:%M:%S')}</li>
+                    </ul>
+                </div>
+                
+                <div style="background-color: #f8d7da; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                    <h4 style="color: #721c24;">⚠️ Action Required:</h4>
+                    <p>Review your trading strategy and consider taking appropriate action based on this sequence pattern.</p>
+                </div>
+                
+                <hr>
+                <p style="font-size: 12px; color: #6c757d;">
+                    This is an automated alert from your TradingView Alert Listener.<br>
+                    Generated at: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
+                </p>
+            </body>
+            </html>
+            """
+            
+            # Send the alert
+            if send_email_alert(subject, body):
+                logging.info(f"🎯 SEQUENCE DETECTED & ALERT SENT!")
+                logging.info(f"   Cobra: {latest_cobra.timestamp} ({latest_cobra.signal_direction})")
+                logging.info(f"   LuxAlgo: {luxalgo_alert.timestamp} ({luxalgo_alert.signal_direction})")
+                logging.info(f"   Time Gap: {time_diff}")
+                return True
+    
+    return False
+
+def extract_body(email_message):
+    """Extract plain text body from an email message."""
+    body = ""
+    # Walk through the email parts to find the text/plain content.
+    if email_message.is_multipart():
+        for part in email_message.walk():
+            # Only process text/plain parts
+            if part.get_content_type() == "text/plain":
+                try:
+                    # Decode the payload. The 'errors="ignore"' handles potential decoding issues.
+                    body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    break  # Found the body, no need to continue
+                except Exception:
+                    continue
+    else:
+        # For non-multipart emails, just get the payload directly.
+        try:
+            body = email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
+        except Exception:
+            body = str(email_message.get_payload())
+    return body
+
+def parse_alert_patterns(body, subject):
+    """Parse email body and subject to extract alert patterns"""
+    detected_patterns = []
+    timestamp = datetime.now()
+    
+    # Regex patterns
+    patterns = {
+        'luxalgo': [
+            r'(bullish|bearish)\s*confirmation\+',
+            r'luxalgo.*?(buy|sell|bullish|bearish)',
+        ],
+        'cobra': [
+            r'cobra\s*algo\s+(buy|sell)\s+alert',
+            r'cobra.*?(buy|sell)',
+            r'🐍.*cobra.*?(buy|sell)',
+        ]
+    }
+
+    # Combine subject + body
+    full_text = f"{subject} {body}".lower()
+    
+    # LuxAlgo
+    for pattern in patterns['luxalgo']:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            signal_direction = match.group(1).lower()
+            symbol_match = re.search(r'([A-Z]{2,6}USD|[A-Z]{3,6})', full_text)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            alert = AlertPattern(
+                timestamp=timestamp,
+                alert_type='luxalgo',
+                signal_direction=signal_direction,
+                raw_text=full_text[:500],
+                symbol=symbol
+            )
+            detected_patterns.append(alert)
+            logging.info(f"💎 LuxAlgo pattern detected: {signal_direction.upper()}")
+            break
+
+    # Cobra
+    for pattern in patterns['cobra']:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            signal_direction = match.group(1).lower()
+            symbol_match = re.search(r'([A-Z]{2,6}USD|[A-Z]{3,6})', full_text)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            alert = AlertPattern(
+                timestamp=timestamp,
+                alert_type='cobra',
+                signal_direction=signal_direction,
+                raw_text=full_text[:500],
+                symbol=symbol
+            )
+            detected_patterns.append(alert)
+            logging.info(f"🐍 Cobra Algo pattern detected: {signal_direction.upper()}")
+            break
+
+    return detected_patterns
+
+
+    
+    # Check body and subject together
+    full_text = f"{subject} {body}"
+    
+    # Check LuxAlgo patterns
+    for pattern in patterns['luxalgo']:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            signal_direction = match.groups(1).lower()
+            symbol_match = re.search(r'([A-Z]{2,6}USD|[A-Z]{3,6})', full_text)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            alert = AlertPattern(
+                timestamp=timestamp,
+                alert_type='luxalgo',
+                signal_direction=signal_direction,
+                raw_text=full_text[:500],
+                symbol=symbol
+            )
+            detected_patterns.append(alert)
+            logging.info(f"💎 LuxAlgo pattern detected: {signal_direction.upper()}")
+            break  # Only match one pattern per type
+    
+    # Check Cobra patterns
+    for pattern in patterns['cobra']:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            signal_direction = match.groups()[-1].lower()
+            symbol_match = re.search(r'([A-Z]{2,6}USD|[A-Z]{3,6})', full_text)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            alert = AlertPattern(
+                timestamp=timestamp,
+                alert_type='cobra',
+                signal_direction=signal_direction,
+                raw_text=full_text[:500],
+                symbol=symbol
+            )
+            detected_patterns.append(alert)
+            logging.info(f"🐍 Cobra Algo pattern detected: {signal_direction.upper()}")
+            break  # Only match one pattern per type
+    
+    return detected_patterns
+
+def process_email(imap, msg_id):
+    """Fetch and process a single email message."""
+    try:
+        # Fetch the email data using its UID.
+        response = imap.fetch([msg_id], ["RFC822"])
+        email_data = response[msg_id][b"RFC822"]
+        email_message = email.message_from_bytes(email_data)
+
+        # Extract message details
+        subject = email_message.get("Subject", "No Subject")
+        sender = email_message.get("From", "Unknown")
+        body = extract_body(email_message)
+
+        # Log email details
+        logging.info("\n📧 New TradingView Alert!")
+        logging.info(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"From: {sender}")
+        logging.info(f"Subject: {subject}")
+        logging.info(f"Body preview: {body[:300]}...")
+
+        # Parse alert patterns
+        detected_patterns = parse_alert_patterns(body, subject)
+        
+        if detected_patterns:
+            # Add patterns to history
+            for pattern in detected_patterns:
+                alert_history.append(pattern)
+                logging.info(f"📝 Added {pattern.alert_type} alert to history")
+            
+            # Check for sequence pattern
+            sequence_detected = check_sequence_pattern()
+            
+            if sequence_detected:
+                logging.info("🎯 SEQUENCE PATTERN DETECTED AND ALERT SENT!")
+            else:
+                logging.info("⏳ Pattern logged, monitoring for sequence...")
+        else:
+            logging.info("⚠️ No known pattern matched this email.")
+
+        # Log current alert history summary
+        cobra_count = sum(1 for alert in alert_history if alert.alert_type == 'cobra')
+        luxalgo_count = sum(1 for alert in alert_history if alert.alert_type == 'luxalgo')
+        logging.info(f"📊 Alert History: {cobra_count} Cobra, {luxalgo_count} LuxAlgo (Total: {len(alert_history)})")
+
+    except Exception as e:
+        logging.error(f"Error processing message {msg_id}: {e}")
+    finally:
+        # Mark the message as seen to avoid reprocessing.
+        imap.add_flags([msg_id], ['\\Seen'])
+
+def check_for_new_alerts(imap):
+    """
+    Search for and process new unseen emails from TradingView.
+    This function is called periodically to catch any new messages.
+    """
+    try:
+        # Search for unseen messages from 'TradingView' or with 'Alert' in the subject.
+        # Use UID search for a more robust and reliable approach.
+        email_ids = imap.search(['UNSEEN', 'FROM', 'TradingView', 'SUBJECT', 'Alert'])
+        
+        if email_ids:
+            logging.info(f"Found {len(email_ids)} new email(s).")
+            # Iterate through the message UIDs and process each one.
+            for msg_id in email_ids:
+                process_email(imap, msg_id)
+        else:
+            logging.info("No new TradingView alerts found.")
+    except Exception as e:
+        logging.error(f"Error checking for new alerts: {e}")
+
+def cleanup_old_alerts():
+    """Remove alerts older than 24 hours to keep memory usage reasonable"""
+    cutoff_time = datetime.now() - timedelta(hours=24)
+    original_count = len(alert_history)
+    
+    # Filter out old alerts
+    while alert_history and alert_history[0].timestamp < cutoff_time:
+        alert_history.popleft()
+    
+    removed_count = original_count - len(alert_history)
+    if removed_count > 0:
+        logging.info(f"🧹 Cleaned up {removed_count} old alerts (older than 24 hours)")
+
+def main():
+    print("🚀 Starting Enhanced TradingView Real-Time Alert Listener")
+    print("🎯 Now detecting LuxAlgo after Cobra Algo sequences!")
+    print("=" * 80)
+    
+    # Test email functionality at startup
+    logging.info("🧪 Testing email functionality...")
+    test_subject = "TradingView Alert Listener Started"
+    test_body = f"""
+    <html>
+    <body>
+        <h2>✅ TradingView Alert Listener Started Successfully</h2>
+        <p>Your enhanced alert listener is now running and monitoring for:</p>
+        <ul>
+            <li>🐍 Cobra Algo alerts</li>
+            <li>💎 LuxAlgo alerts</li>
+            <li>🎯 Sequential patterns (LuxAlgo after Cobra)</li>
+        </ul>
+        <p><strong>Sequence Detection Window:</strong> {CONFIG['sequence_window_minutes']} minutes</p>
+        <p><strong>Started at:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    </body>
+    </html>
+    """
+    
+    send_email_alert(test_subject, test_body)
+
+    try:
+        # Connect to the IMAP server securely.
+        with IMAPClient(CONFIG["email_server"], port=CONFIG["email_port"], ssl=True) as imap:
+            imap.login(CONFIG["email_user"], CONFIG["email_pass"])
+            logging.info("✅ Logged in successfully.")
+
+            # Select the mailbox to monitor.
+            imap.select_folder(CONFIG["mailbox"])
+            logging.info(f"✅ Selected mailbox: {CONFIG['mailbox']}")
+            
+            # Initially check for any alerts that arrived while the script was offline.
+            check_for_new_alerts(imap)
+            
+            if imap.has_capability("IDLE"):
+                logging.info("✅ Server supports IMAP IDLE. Entering real-time mode...")
+                print("\nPress Ctrl+C to stop the listener.")
+                
+                # Use a while loop to continuously check for new emails using IDLE.
+                while True:
+                    try:
+                        # Periodic cleanup of old alerts
+                        cleanup_old_alerts()
+                        
+                        # Enter IDLE state and wait for a response.
+                        logging.info("⏳ Waiting for new alerts (IDLE mode)...")
+                        imap.idle()
+                        
+                        # Wait for up to 60 seconds for new mail.
+                        # If a new email arrives, idle_check will return immediately.
+                        responses = imap.idle_check(timeout=60)
+                        
+                        if responses:
+                            # A new message event was received. Exit IDLE mode to process.
+                            imap.idle_done()
+                            logging.info("🔔 New message event received. Processing...")
+                            check_for_new_alerts(imap)
+                        else:
+                            # If no messages in 60s, exit IDLE mode to keep the connection alive.
+                            imap.idle_done()
+                            logging.info("Timeout. Keeping connection alive...")
+                            time.sleep(1) # Small delay before re-entering IDLE
+                            
+                    except KeyboardInterrupt:
+                        logging.info("\n🛑 Exiting IDLE mode...")
+                        imap.idle_done()
+                        break
+                    except Exception as e:
+                        logging.error(f"Error during IDLE loop, restarting: {e}")
+                        time.sleep(5)  # Wait before retrying to prevent rapid failures
+
+            else:
+                logging.warning("⚠️ IMAP IDLE not supported. Falling back to polling every 60 seconds.")
+                while True:
+                    check_for_new_alerts(imap)
+                    cleanup_old_alerts()
+                    time.sleep(60)
+
+    except KeyboardInterrupt:
+        logging.info("\n🛑 Stopping listener...")
+    except Exception as e:
+        logging.critical(f"A fatal error occurred: {e}")
+    finally:
+        logging.info("Script has stopped.")
+
+
+if __name__ == "__main__":
+    main()
