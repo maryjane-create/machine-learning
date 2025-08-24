@@ -1,0 +1,204 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.stattools import coint
+from scipy import stats
+
+# -------------------------------
+# 1. Load and Prepare Data
+# -------------------------------
+def load_data(folder_path):
+    """
+    Load all CSV files from a folder, extract 'close' prices, and align by date.
+    """
+    all_data = {}
+    # List files directly in the specified folder_path
+    for file in os.listdir(folder_path):
+        if file.endswith('.csv'):
+            # Extract symbol from filename, removing the extension
+            symbol = os.path.splitext(file)[0]
+            # Construct the full file path
+            file_path = os.path.join(folder_path, file)
+            try:
+                df = pd.read_csv(file_path)
+                # Ensure 'time' column exists and is converted to datetime
+                if 'time' in df.columns:
+                    df['time'] = pd.to_datetime(df['time'])
+                    df.set_index('time', inplace=True)
+                    # Ensure 'close' column exists
+                    if 'close' in df.columns:
+                        all_data[symbol] = df['close']
+                    else:
+                        print(f"Warning: 'close' column not found in {file}")
+                else:
+                    print(f"Warning: 'time' column not found in {file}")
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+
+    # Combine into a single DataFrame and align dates
+    if not all_data:
+        print("No valid data loaded from the specified folder.")
+        return pd.DataFrame()
+
+    price_df = pd.DataFrame(all_data)
+    price_df.sort_index(inplace=True)
+    price_df = price_df.dropna()  # Remove missing values
+    return price_df
+
+# -------------------------------
+# 2. Correlation Matrix (on log returns)
+# -------------------------------
+def compute_correlation_matrix(price_df):
+    """
+    Compute Pearson correlation matrix of daily log returns.
+    """
+    if price_df.empty:
+        return pd.DataFrame()
+    returns_df = np.log(price_df / price_df.shift(1)).dropna()
+    if returns_df.empty:
+        print("Warning: Not enough data after calculating returns to compute correlation matrix.")
+        return pd.DataFrame()
+    return returns_df.corr()
+
+# -------------------------------
+# 3. Cointegration Matrix
+# -------------------------------
+def compute_cointegration_matrix(price_df, p_value_threshold=0.05):
+    """
+    Compute pairwise cointegration p-values (Engle-Granger test).
+    Lower p-values indicate stronger cointegration.
+    """
+    if price_df.empty:
+        return pd.DataFrame()
+
+    symbols = price_df.columns
+    n = len(symbols)
+    coint_matrix = np.ones((n, n))  # Initialize with 1s (no cointegration)
+
+    # Ensure enough data points for cointegration test
+    min_data_points = 50 # Minimum required observations for coint test
+    if len(price_df) < min_data_points:
+        print(f"Warning: Not enough data ({len(price_df)} observations) to perform cointegration test. Minimum required: {min_data_points}")
+        return pd.DataFrame(coint_matrix, index=symbols, columns=symbols)
+
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Ensure enough overlapping data for the pair
+                pair_data = price_df[[symbols[i], symbols[j]]].dropna()
+                if len(pair_data) >= min_data_points:
+                    try:
+                        score, p_value, _ = coint(pair_data[symbols[i]], pair_data[symbols[j]])
+                        coint_matrix[i, j] = p_value
+                    except Exception as e:
+                        # Handle cases where coint test might fail (e.g., non-stationary data)
+                        coint_matrix[i, j] = np.nan # Indicate test failed
+                        print(f"Warning: Cointegration test failed for {symbols[i]}-{symbols[j]}: {e}")
+                else:
+                    coint_matrix[i, j] = np.nan # Indicate insufficient data for the pair
+            else:
+                coint_matrix[i, j] = 0.0  # Diagonal: self vs self (not meaningful, set to 0)
+
+    # Convert to DataFrame
+    coint_df = pd.DataFrame(coint_matrix, index=symbols, columns=symbols)
+    return coint_df
+
+# -------------------------------
+# 4. Plot Heatmaps
+# -------------------------------
+def plot_matrices(correlation_df, cointegration_df):
+    """
+    Plot correlation and cointegration matrices as heatmaps.
+    """
+    # Check if DataFrames are empty
+    if correlation_df.empty and cointegration_df.empty:
+        print("No data to plot.")
+        return
+    elif correlation_df.empty:
+        print("Correlation data is empty. Plotting only cointegration matrix.")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(cointegration_df, annot=False, cmap='RdYlGn_r', center=0.05, ax=ax, square=True)
+        ax.set_title('Cointegration P-Values (Lower = More Cointegrated)')
+        plt.tight_layout()
+        plt.show()
+        return
+    elif cointegration_df.empty:
+        print("Cointegration data is empty. Plotting only correlation matrix.")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(correlation_df, annot=True, cmap='coolwarm', center=0, ax=ax, square=True)
+        ax.set_title('Correlation Matrix (Log Returns)')
+        plt.tight_layout()
+        plt.show()
+        return
+
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Correlation Heatmap
+    sns.heatmap(correlation_df, annot=True, cmap='coolwarm', center=0, ax=axes[0], square=True, fmt=".2f") # Added fmt for formatting
+    axes[0].set_title('Correlation Matrix (Log Returns)')
+
+    # Cointegration Heatmap (lower p-value = more cointegrated)
+    # Set vmin/vmax for better color mapping of p-values
+    sns.heatmap(cointegration_df, annot=False, cmap='RdYlGn_r', vmin=0, vmax=0.1, ax=axes[1], square=True)
+    axes[1].set_title('Cointegration P-Values (Lower = More Cointegrated)\n(Showing P-values < 0.1)')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------------------
+# 5. Main Execution
+# -------------------------------
+if __name__ == "__main__":
+    # Set your data folder path here. Using '/content/' as the files are directly there.
+    folder_path = '/content/'
+
+    print("Loading data...")
+    price_df = load_data(folder_path)
+
+    if not price_df.empty:
+        print(f"Loaded data for {len(price_df.columns)} assets.")
+        print(f"Data shape: {price_df.shape}")
+
+        print("Computing correlation matrix...")
+        corr_matrix = compute_correlation_matrix(price_df)
+
+        print("Computing cointegration matrix...")
+        coint_matrix = compute_cointegration_matrix(price_df)
+
+        # Display or save results
+        if not corr_matrix.empty:
+            print("\n--- Correlation Matrix ---")
+            print(corr_matrix.round(3))
+        else:
+            print("\n--- Correlation Matrix could not be computed ---")
+
+
+        if not coint_matrix.empty:
+            print("\n--- Cointegration P-Values Matrix ---")
+            print(coint_matrix.round(4))
+        else:
+             print("\n--- Cointegration Matrix could not be computed ---")
+
+
+        # Plot heatmaps
+        if not corr_matrix.empty or not coint_matrix.empty:
+            plot_matrices(corr_matrix, coint_matrix)
+        else:
+            print("\nNo matrices to plot.")
+
+
+        # Optional: Save matrices to CSV
+        if not corr_matrix.empty:
+            corr_matrix.to_csv('correlation_matrix.csv')
+            print("Correlation matrix saved to correlation_matrix.csv.")
+        if not coint_matrix.empty:
+            coint_matrix.to_csv('cointegration_matrix.csv')
+            print("Cointegration matrix saved to cointegration_matrix.csv.")
+
+    else:
+        print("Failed to load data. Please check the folder path and file format.")
