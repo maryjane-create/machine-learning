@@ -1,0 +1,730 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+import time
+import logging
+
+import oandapyV20
+import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.orders as orders
+import oandapyV20.endpoints.positions as positions
+import oandapyV20.endpoints.accounts as accounts
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class Model29AutoTradingStrategy:
+    def __init__(self, initial_capital=10000, api_key=None, account_id=None, practice=True, trade_size=1000):
+        self.initial_capital = initial_capital
+        self.api_key = api_key
+        self.account_id = account_id
+        self.trade_size = trade_size  # Position size in units
+        self.api_url = "https://api-fxpractice.oanda.com/v3" if practice else "https://api-fxtrade.oanda.com/v3"
+        self.client = oandapyV20.API(access_token=self.api_key, environment="practice" if practice else "live")
+        
+        # Strategy parameters 
+        self.entry_level = -1.5
+        self.exit_level = 1.5
+        self.rsi_oversold = 30
+        self.rsi_overbought = 70
+        self.rsi_length = 5        # WMA length for RSI (not RSI period!)
+        self.rsi_timeframe = "H1"  # 1 hour timeframe
+        self.spread_lookback = 5   # SMA and STDEV lookback
+        
+        # State tracking 
+        self.prev_z = None  # This is the key variable for cross-over detection
+        self.current_position = 0
+        self.last_trade_time = None
+        self.trades_log = []
+        
+    def _fetch_instrument(self, instrument, count=100, granularity="M5"):
+        """Fetch recent candles for a given instrument"""
+        params = {
+            "count": count,
+            "granularity": granularity,
+            "price": "M"  # Midpoint prices
+        }
+        r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+        self.client.request(r)
+        
+        candles = r.response.get("candles", [])
+        df = pd.DataFrame([
+            {
+                "time": pd.to_datetime(c["time"]),
+                "open": float(c["mid"]["o"]),
+                "high": float(c["mid"]["h"]),
+                "low": float(c["mid"]["l"]),
+                "close": float(c["mid"]["c"])
+            }
+            for c in candles if c["complete"]
+        ])
+        
+        if not df.empty:
+            df.set_index("time", inplace=True)
+        return df
+
+    def _calculate_wma(self, series, length):
+        """Calculate Weighted Moving Average (WMA) - matching Pine Script ta.wma()"""
+        if len(series) < length:
+            return pd.Series([np.nan] * len(series), index=series.index)
+        
+        def wma_single(x):
+            if len(x) < length:
+                return np.nan
+            weights = np.arange(1, length + 1)
+            return np.dot(x[-length:], weights) / weights.sum()
+        
+        return series.rolling(window=length, min_periods=length).apply(wma_single, raw=True)
+
+    def fetch_current_data(self):
+        """Fetch current market data and calculate indicators - EXACTLY matching Pine Script"""
+        try:
+            logger.info("Fetching current market data...")
+            
+            # Fetch data for instruments and timeframes
+            # uses XAUAUD on 5min for btc, USDJPY on 5min for doge
+            xauaud_5min = self._fetch_instrument("XAU_AUD", count=5000, granularity="M5")  # 5min for signals
+            usdjpy_5min = self._fetch_instrument("USD_JPY", count=5000, granularity="M5")  # 5min for signals
+            xauaud_1hr = self._fetch_instrument("XAU_AUD", count=1000, granularity="H1")   # 1hr for trading
+            
+            # RSI is calculated on 1hr timeframe with WMA type (length 5)
+            xauaud_1hr_rsi = self._fetch_instrument("XAU_AUD", count=1000, granularity="H1")  # 1hr for RSI
+            
+            if xauaud_5min.empty or usdjpy_5min.empty or xauaud_1hr.empty or xauaud_1hr_rsi.empty:
+                logger.error("Failed to fetch required data")
+                return None
+                
+            # Use previous bar's close values to prevent repainting (close[1] in Pine Script)
+            # This means we use the confirmed/completed bars only
+            xauaud_5min = xauaud_5min[:-1]      # Remove current incomplete bar
+            usdjpy_5min = usdjpy_5min[:-1]      # Remove current incomplete bar
+            xauaud_1hr = xauaud_1hr[:-1]        # Remove current incomplete bar
+            xauaud_1hr_rsi = xauaud_1hr_rsi[:-1] # Remove current incomplete bar
+            
+            # Resample 5min data to 1hr for alignment
+            xauaud_5min_1hr = xauaud_5min.resample('1H').last().fillna(method="ffill")
+            usdjpy_5min_1hr = usdjpy_5min.resample('1H').last().fillna(method="ffill")
+            
+            # Align to 1hr XAUAUD index
+            common_index = xauaud_1hr.index.intersection(xauaud_5min_1hr.index).intersection(usdjpy_5min_1hr.index)
+            if len(common_index) < 50:  # Need enough data for calculations
+                logger.error("Insufficient aligned data points")
+                return None
+                
+            df = pd.DataFrame({
+                "xauaud_close": xauaud_1hr.loc[common_index, "close"],           # 1hr for trading
+                "xauaud_close_5min": xauaud_5min_1hr.loc[common_index, "close"], # 5min resampled for signals
+                "usdjpy_close": usdjpy_5min_1hr.loc[common_index, "close"],      # 5min resampled for signals
+            })
+            
+            # Calculate log values (math.log())
+            df["btc"] = np.log(df["xauaud_close_5min"])  # Use 5min resampled for signals
+            df["doge"] = np.log(df["usdjpy_close"])      # Use 5min resampled for signals
+            
+            # Calculate spread exactly as Pine Script: btc - doge
+            df["spread"] = df["btc"] - df["doge"]
+            
+            # Calculate SMA and STDEV with lookback=5
+            df["spread_ma"] = df["spread"].rolling(window=self.spread_lookback).mean()  # ta.sma(spread, 5)
+            df["spread_std"] = df["spread"].rolling(window=self.spread_lookback).std()  # ta.stdev(spread, 5)
+            
+            # Calculate Z-Score exactly as Pine Script: (spread - spread_ma) / spread_std
+            df["z_score"] = (df["spread"] - df["spread_ma"]) / df["spread_std"]
+            
+            # RSI calculation on 1hr XAUAUD data with WMA type, length 5
+            df["rsi_smoothed"] = self._calculate_rsi_wma(xauaud_1hr_rsi.loc[common_index, "close"], self.rsi_length)
+            
+            # Remove NaN values but ensure we have enough data (bar_index >= 30 condition)
+            df = df.dropna()
+            
+            if len(df) < 30:  # bar_index >= 30 condition
+                logger.error("Insufficient data after calculations (need bar_index >= 30)")
+                return None
+            
+            logger.info(f"Data processed: {len(df)} valid 1-hour rows")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching data: {e}")
+            return None
+
+    def _calculate_rsi_30min(self, prices_30min, target_index):
+        """Calculate RSI on 30min data and align to 5min index"""
+        rsi_30min = self._calculate_rsi_wma(prices_30min, self.rsi_length)
+        
+        # Align 30min RSI to 5min timeframe by forward filling
+        rsi_aligned = pd.Series(index=target_index, dtype=float)
+        
+        for timestamp in target_index:
+            # Find the most recent 30min RSI value
+            valid_rsi = rsi_30min[rsi_30min.index <= timestamp]
+            if not valid_rsi.empty:
+                rsi_aligned[timestamp] = valid_rsi.iloc[-1]
+                
+        return rsi_aligned
+
+    def _calculate_rsi_wma(self, prices, length=5):
+        """Calculate RSI using WMA (Weighted Moving Average) - matching TradingView RSI with Type=WMA"""
+        if len(prices) < length:
+            return pd.Series([np.nan] * len(prices), index=prices.index)
+        
+        # Calculate price changes
+        delta = prices.diff()
+        
+        # Separate gains and losses
+        gains = delta.where(delta > 0, 0)
+        losses = -delta.where(delta < 0, 0)
+        
+        # Calculate WMA of gains and losses
+        avg_gains = self._calculate_wma(gains, length)
+        avg_losses = self._calculate_wma(losses, length)
+        
+        # Calculate RSI
+        rs = avg_gains / avg_losses
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+    def get_current_position(self, instrument="XAU_AUD"):
+        """Get current position for the instrument"""
+        try:
+            r = positions.OpenPositions(accountID=self.account_id)
+            self.client.request(r)
+            
+            for position in r.response.get("positions", []):
+                if position["instrument"] == instrument:
+                    long_units = float(position["long"]["units"])
+                    short_units = float(position["short"]["units"])
+                    return long_units + short_units
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error getting position: {e}")
+            return 0
+
+    def place_market_order(self, instrument, units, order_type="MARKET"):
+        """Place a market order"""
+        try:
+            order_data = {
+                "order": {
+                    "type": order_type,
+                    "instrument": instrument,
+                    "units": str(int(units)),
+                    "timeInForce": "FOK",  # Fill or Kill
+                    "positionFill": "DEFAULT"
+                }
+            }
+            
+            r = orders.OrderCreate(accountID=self.account_id, data=order_data)
+            self.client.request(r)
+            
+            logger.info(f"Order placed: {units} units of {instrument}")
+            return r.response
+            
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return None
+
+    def close_position(self, instrument="XAU_AUD"):
+        """Close current position"""
+        try:
+            current_pos = self.get_current_position(instrument)
+            if abs(current_pos) > 0:
+                # Close by placing opposite order
+                close_units = -current_pos
+                return self.place_market_order(instrument, close_units)
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+            return None
+
+    def check_trading_conditions(self, df):
+        """Check for entry and exit conditions - EXACTLY matching Pine Script logic"""
+        if len(df) < 2:
+            return False, False
+            
+        # Get current confirmed values ( confirmed bar)
+        current_z = df["z_score"].iloc[-1]
+        current_rsi = df["rsi_smoothed"].iloc[-1]
+        
+        # Initialize prev_z if not set (first run)
+        if self.prev_z is None and len(df) >= 2:
+            self.prev_z = df["z_score"].iloc[-2]
+            
+        if self.prev_z is None or pd.isna(current_z) or pd.isna(current_rsi):
+            return False, False
+            
+      
+        # longCondition := prev_z >= entryLevel and z_score < entryLevel and rsi_smoothed < rsi_oversold
+        long_condition = (self.prev_z >= self.entry_level and 
+                         current_z < self.entry_level and 
+                         current_rsi < self.rsi_oversold)
+        
+        # exitCondition := prev_z <= exitLevel and z_score > exitLevel and rsi_smoothed > rsi_overbought
+        exit_condition = (self.prev_z <= self.exit_level and 
+                         current_z > self.exit_level and 
+                         current_rsi > self.rsi_overbought)
+        
+        logger.info(f"Z-Score: {current_z:.4f} (prev: {self.prev_z:.4f}), RSI: {current_rsi:.2f}")
+        logger.info(f"Long condition: {long_condition}, Exit condition: {exit_condition}")
+        
+        return long_condition, exit_condition
+
+    def execute_trading_logic(self, instrument="XAU_AUD"):
+        """Main trading logic execution - EXACTLY matching Pine Script strategy logic"""
+        try:
+            # Fetch current data
+            df = self.fetch_current_data()
+            if df is None or len(df) < 30:  #  bar_index > 30 condition
+                logger.warning("Insufficient data for trading decisions (need bar_index >= 30)")
+                return
+                
+            # Get current position (strategy.opentrades > 0)
+            current_position = self.get_current_position(instrument)
+            self.current_position = current_position
+            in_long_position = current_position > 0
+            
+            # Check trading conditions
+            long_condition, exit_condition = self.check_trading_conditions(df)
+            
+            # Update prev_z AFTER using it for conditions (matching Pine Script order)
+            current_z = df["z_score"].iloc[-1]
+            if not pd.isna(current_z):
+                self.prev_z = current_z
+            
+         
+            # canEnter = bar_index > 30 and longCondition and not inLongPosition
+            can_enter = len(df) >= 30 and long_condition and not in_long_position
+            
+            # canExit = bar_index > 30 and exitCondition and inLongPosition  
+            can_exit = len(df) >= 30 and exit_condition and in_long_position
+            
+            # Execute trades 
+            if can_enter:
+                logger.info("ENTRY SIGNAL: Opening long position")
+                order_response = self.place_market_order(instrument, self.trade_size)
+                if order_response:
+                    self.trades_log.append({
+                        "timestamp": datetime.now(),
+                        "action": "ENTRY",
+                        "z_score": df["z_score"].iloc[-1],
+                        "rsi": df["rsi_smoothed"].iloc[-1],
+                        "units": self.trade_size
+                    })
+                    
+            elif can_exit:
+                logger.info("EXIT SIGNAL: Closing long position")
+                order_response = self.close_position(instrument)
+                if order_response:
+                    self.trades_log.append({
+                        "timestamp": datetime.now(),
+                        "action": "EXIT",
+                        "z_score": df["z_score"].iloc[-1],
+                        "rsi": df["rsi_smoothed"].iloc[-1],
+                        "units": -current_position
+                    })
+                    
+        except Exception as e:
+            logger.error(f"Error in trading logic: {e}")
+
+    def get_account_summary(self):
+        """Get account balance and open positions"""
+        try:
+            r = accounts.AccountSummary(accountID=self.account_id)
+            self.client.request(r)
+            
+            balance = float(r.response["account"]["balance"])
+            unrealized_pl = float(r.response["account"]["unrealizedPL"])
+            
+            logger.info(f"Account Balance: ${balance:.2f}, Unrealized P&L: ${unrealized_pl:.2f}")
+            return balance, unrealized_pl
+            
+        except Exception as e:
+            logger.error(f"Error getting account summary: {e}")
+            return None, None
+
+    def run_live_trading(self, check_interval=300, max_iterations=None):
+        """
+        Run live trading strategy
+        
+        Args:
+            check_interval: Seconds between strategy checks (default 5 minutes)
+            max_iterations: Maximum number of iterations (None for unlimited)
+        """
+        logger.info("Starting live trading strategy...")
+        logger.info(f"Check interval: {check_interval} seconds")
+        
+        iteration = 0
+        
+        try:
+            while True:
+                if max_iterations and iteration >= max_iterations:
+                    logger.info("Maximum iterations reached, stopping...")
+                    break
+                    
+                iteration += 1
+                logger.info(f"\n=== Trading Check #{iteration} ===")
+                
+                # Get account status
+                balance, unrealized_pl = self.get_account_summary()
+                
+                # Execute trading logic
+                self.execute_trading_logic()
+                
+                # Print recent trades
+                if self.trades_log:
+                    logger.info("Recent trades:")
+                    for trade in self.trades_log[-3:]:  # Show last 3 trades
+                        logger.info(f"  {trade['timestamp']}: {trade['action']} - Z:{trade['z_score']:.4f}, RSI:{trade['rsi']:.2f}")
+                
+                # Wait for next check
+                logger.info(f"Waiting {check_interval} seconds until next check...")
+                time.sleep(check_interval)
+                
+        except KeyboardInterrupt:
+            logger.info("Trading stopped by user")
+        except Exception as e:
+            logger.error(f"Error in live trading: {e}")
+        finally:
+            logger.info("Trading strategy stopped")
+
+    def backtest_strategy(self, start_date="2021-01-01", end_date=None):
+        """Backtest the strategy on historical data - EXACTLY matching Pine Script"""
+        logger.info("Running backtest...")
+        
+        df = self.fetch_data(start_date, end_date)
+        if df is None:
+            return None
+            
+        # Calculate indicators exactly as Pine Script
+        df = self.calculate_indicators(df)
+        
+        # Remove insufficient data (matching bar_index >= 30)
+        df = df.iloc[30:].copy()  # Start after sufficient data
+        
+        # Simulate trading 
+        equity = self.initial_capital
+        position = 0
+        entry_price = 0
+        trades = []
+        equity_curve = [equity]
+        
+        # Initialize prev_z ( var float prev_z = na)
+        prev_z = None
+        in_long_position = False
+        
+        for i in range(len(df)):
+            current_z = df["z_score"].iloc[i]
+            current_rsi = df["rsi_smoothed"].iloc[i]
+            current_price = df["xauaud_close"].iloc[i]  # Changed to XAUAUD price
+            
+            if pd.isna(current_z) or pd.isna(current_rsi):
+                continue
+                
+            # Initialize prev_z if needed
+            if prev_z is None and i > 0:
+                prev_z = df["z_score"].iloc[i-1] if not pd.isna(df["z_score"].iloc[i-1]) else None
+                continue
+                
+            if prev_z is None:
+                continue
+                
+            # conditions
+            long_condition = (prev_z >= self.entry_level and 
+                            current_z < self.entry_level and 
+                            current_rsi < self.rsi_oversold)
+            
+            exit_condition = (prev_z <= self.exit_level and 
+                            current_z > self.exit_level and 
+                            current_rsi > self.rsi_overbought)
+            
+            # Update prev_z 
+            prev_z = current_z
+            
+            # Entry and exit logic 
+            can_enter = long_condition and not in_long_position
+            can_exit = exit_condition and in_long_position
+            
+            # Execute trades 
+            if can_enter:
+                position = self.trade_size / current_price
+                entry_price = current_price
+                in_long_position = True
+                trades.append({
+                    "date": df.index[i],
+                    "action": "ENTRY",
+                    "price": current_price,
+                    "z_score": current_z,
+                    "rsi": current_rsi
+                })
+                logger.info(f"ENTRY at {df.index[i]}: Z={current_z:.4f}, RSI={current_rsi:.2f}")
+                
+            elif can_exit:
+                # Calculate P&L
+                pnl = position * (current_price - entry_price)
+                equity += pnl
+                trades.append({
+                    "date": df.index[i],
+                    "action": "EXIT",
+                    "price": current_price,
+                    "z_score": current_z,
+                    "rsi": current_rsi,
+                    "pnl": pnl
+                })
+                logger.info(f"EXIT at {df.index[i]}: Z={current_z:.4f}, RSI={current_rsi:.2f}, P&L={pnl:.2f}")
+                position = 0
+                in_long_position = False
+                
+            equity_curve.append(equity)
+            
+        return {
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "final_equity": equity,
+            "total_return": (equity - self.initial_capital) / self.initial_capital * 100
+        }
+
+    def calculate_indicators(self, df):
+        """Calculate all required indicators EXACTLY matching Pine Script"""
+        # Use 5min resampled data for signal generation
+        # Log values for BTC and DOGE proxies
+        df["btc"] = np.log(df["xauaud_close_5min"])  # Use 5min data for signals
+        df["doge"] = np.log(df["usdjpy_close"])       # Use 5min data for signals
+        
+        # Calculate spread
+        df["spread"] = df["btc"] - df["doge"]
+        
+        # Calculate spread MA and STD 
+        df["spread_ma"] = df["spread"].rolling(window=self.spread_lookback).mean()  # ta.sma(spread, 5)
+        df["spread_std"] = df["spread"].rolling(window=self.spread_lookback).std()  # ta.stdev(spread, 5)
+        
+        # Calculate z-score (matching Pine Script formula)
+        df["z_score"] = (df["spread"] - df["spread_ma"]) / df["spread_std"]
+        
+        # Calculate RSI with WMA type on 1hr XAUAUD data (matching TradingView settings)
+        df["rsi_smoothed"] = self._calculate_rsi_wma(df["xauaud_close"], self.rsi_length)  # RSI WMA length 5
+        
+        return df
+
+    def fetch_data(self, start_date="2021-01-01", end_date=None):
+        """Fetch historical data for backtesting"""
+        if end_date is None:
+            end_date = datetime.utcnow()
+        else:
+            end_date = pd.to_datetime(end_date)
+            
+        start_date = pd.to_datetime(start_date)
+        
+        logger.info("Fetching historical data for backtesting...")
+        
+        # OANDA has limits on count parameter
+        max_count_1hr = 5000   # Maximum for 1-hour data
+        max_count_5min = 5000  # Maximum for 5-minute data 
+        
+        try:
+            # Fetch data with OANDA API limits in mind
+            logger.info("Fetching 1-hour XAUAUD data...")
+            xauaud_1hr = self._fetch_instrument("XAU_AUD", count=max_count_1hr, granularity="H1")
+            
+            logger.info("Fetching 5-minute XAUAUD data...")
+            xauaud_5min = self._fetch_instrument("XAU_AUD", count=max_count_5min, granularity="M5")
+            
+            logger.info("Fetching 5-minute USDJPY data...")
+            usdjpy_5min = self._fetch_instrument("USD_JPY", count=max_count_5min, granularity="M5")
+            
+            if xauaud_5min.empty or usdjpy_5min.empty or xauaud_1hr.empty:
+                logger.error("Failed to fetch historical data")
+                return None
+                
+            # Combine 5min data for signal generation
+            logger.info("Processing signal data...")
+            signal_df = pd.DataFrame({
+                "xauaud_close_5min": xauaud_5min["close"],
+                "usdjpy_close_5min": usdjpy_5min["close"],
+            })
+            signal_df = signal_df.fillna(method="ffill").dropna()
+            
+            # Resample 5min signals to 1hr for trading alignment
+            logger.info("Resampling signals to 1-hour...")
+            signal_df_1hr = signal_df.resample('1H').last().fillna(method="ffill")
+            
+            # Align indices - find common timestamps
+            common_index = xauaud_1hr.index.intersection(signal_df_1hr.index)
+            
+            if len(common_index) < 100:  # Need sufficient data
+                logger.error(f"Insufficient aligned data: only {len(common_index)} common timestamps")
+                return None
+            
+            # Combine with 1hr XAUAUD trading data
+            df = pd.DataFrame({
+                "xauaud_close": xauaud_1hr.loc[common_index, "close"],  # 1hr prices for trading
+                "xauaud_close_5min": signal_df_1hr.loc[common_index, "xauaud_close_5min"],  # 5min signals resampled
+                "usdjpy_close": signal_df_1hr.loc[common_index, "usdjpy_close_5min"],       # 5min signals resampled
+            })
+            
+            df = df.fillna(method="ffill").dropna()
+            
+            logger.info(f"Historical data fetched: {len(df)} 1-hour rows from {df.index[0]} to {df.index[-1]}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return None
+
+    def plot_results(self, backtest_results, df):
+        """Plot backtest results"""
+        if not backtest_results or df is None:
+            return
+            
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Z-Score plot
+        ax1.plot(df.index, df["z_score"], label="Z-Score", color="orange")
+        ax1.axhline(y=self.entry_level, color="green", linestyle="--", label=f"Entry Level ({self.entry_level})")
+        ax1.axhline(y=self.exit_level, color="red", linestyle="--", label=f"Exit Level ({self.exit_level})")
+        ax1.axhline(y=0, color="gray", alpha=0.5)
+        ax1.set_title("Z-Score")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # RSI plot
+        ax2.plot(df.index, df["rsi_smoothed"], label="RSI Smoothed", color="blue")
+        ax2.axhline(y=self.rsi_oversold, color="green", linestyle=":", label=f"Oversold ({self.rsi_oversold})")
+        ax2.axhline(y=self.rsi_overbought, color="red", linestyle=":", label=f"Overbought ({self.rsi_overbought})")
+        ax2.set_title("RSI Smoothed")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Price chart with trade markers
+        ax3.plot(df.index, df["xauaud_close"], label="XAU/AUD", alpha=0.7)
+        
+        for trade in backtest_results["trades"]:
+            if trade["action"] == "ENTRY":
+                ax3.scatter(trade["date"], trade["price"], color="green", marker="^", s=100, label="Entry" if "Entry" not in [l.get_label() for l in ax3.get_children()] else "")
+            elif trade["action"] == "EXIT":
+                ax3.scatter(trade["date"], trade["price"], color="red", marker="v", s=100, label="Exit" if "Exit" not in [l.get_label() for l in ax3.get_children()] else "")
+        
+        ax3.set_title("XAU/AUD with Trade Signals")
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # Equity curve
+        ax4.plot(backtest_results["equity_curve"], color="purple")
+        ax4.set_title(f"Equity Curve - Total Return: {backtest_results['total_return']:.2f}%")
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+
+    def print_trade_summary(self, backtest_results):
+        """Print summary of backtest results"""
+        if not backtest_results:
+            return
+            
+        trades = backtest_results["trades"]
+        
+        print("\n" + "="*50)
+        print("BACKTEST SUMMARY")
+        print("="*50)
+        print(f"Initial Capital: ${self.initial_capital:,.2f}")
+        print(f"Final Equity: ${backtest_results['final_equity']:,.2f}")
+        print(f"Total Return: {backtest_results['total_return']:.2f}%")
+        print(f"Total Trades: {len([t for t in trades if t['action'] == 'ENTRY'])}")
+        
+        # Calculate trade statistics
+        entry_trades = [t for t in trades if t["action"] == "ENTRY"]
+        exit_trades = [t for t in trades if t["action"] == "EXIT" and "pnl" in t]
+        
+        if exit_trades:
+            pnls = [t["pnl"] for t in exit_trades]
+            winning_trades = [p for p in pnls if p > 0]
+            losing_trades = [p for p in pnls if p < 0]
+            
+            print(f"Completed Trades: {len(exit_trades)}")
+            print(f"Winning Trades: {len(winning_trades)} ({len(winning_trades)/len(exit_trades)*100:.1f}%)")
+            print(f"Average Win: ${np.mean(winning_trades):.2f}" if winning_trades else "Average Win: N/A")
+            print(f"Average Loss: ${np.mean(losing_trades):.2f}" if losing_trades else "Average Loss: N/A")
+            print(f"Best Trade: ${max(pnls):.2f}")
+            print(f"Worst Trade: ${min(pnls):.2f}")
+        
+        print("\nRecent Trades:")
+        for trade in trades[-5:]:  # Show last 5 trades
+            action_str = f"{trade['action']:<5}"
+            if 'pnl' in trade:
+                print(f"  {trade['date']} | {action_str} | Z:{trade['z_score']:7.4f} | RSI:{trade['rsi']:6.2f} | P&L:${trade['pnl']:8.2f}")
+            else:
+                print(f"  {trade['date']} | {action_str} | Z:{trade['z_score']:7.4f} | RSI:{trade['rsi']:6.2f}")
+
+
+def main():
+    """Main execution function"""
+    # IMPORTANT: Replace with your actual OANDA credentials
+    API_KEY = "ed8532dc1f105e66db76dbd2b13d0fef-069204ad50e2ba47935775d37816d3bc"
+    ACCOUNT_ID = "101-011-36232014-001"
+    
+    # Initialize strategy
+    strategy = Model29AutoTradingStrategy(
+        initial_capital=10000,
+        api_key=API_KEY,
+        account_id=ACCOUNT_ID,
+        practice=True,  # Set to False for live trading
+        trade_size=10000  # Position size in units
+    )
+    
+    print("Model 29 Auto Trading Strategy")
+    print("1. Run Backtest")
+    print("2. Start Live Trading")
+    print("3. Check Account Status")
+    
+    choice = input("Select option (1-3): ").strip()
+    
+    if choice == "1":
+        # Run backtest
+        logger.info("Running backtest...")
+        df = strategy.fetch_data(start_date="2010-01-01")
+        if df is not None:
+            df = strategy.calculate_indicators(df)
+            backtest_results = strategy.backtest_strategy()
+            strategy.print_trade_summary(backtest_results)
+            # Uncomment to show plots
+            # strategy.plot_results(backtest_results, df)
+        
+    elif choice == "2":
+        # Start live trading
+        check_interval = int(input("Enter check interval in seconds (default 300): ") or "300")
+        max_iterations = input("Enter max iterations (press Enter for unlimited): ").strip()
+        max_iterations = int(max_iterations) if max_iterations else None
+        
+        logger.info("Starting live trading...")
+        logger.info("Press Ctrl+C to stop trading")
+        
+        strategy.run_live_trading(check_interval=check_interval, max_iterations=max_iterations)
+        
+    elif choice == "3":
+        # Check account status
+        balance, unrealized_pl = strategy.get_account_summary()
+        current_pos = strategy.get_current_position("XAU_AUD")
+        print(f"\nAccount Balance: ${balance:.2f}")
+        print(f"Unrealized P&L: ${unrealized_pl:.2f}")
+        print(f"Current XAU/AUD Position: {current_pos} units")
+        
+        # Fetch and display current indicators
+        df = strategy.fetch_current_data()
+        if df is not None and len(df) > 0:
+            print(f"\nCurrent Indicators:")
+            print(f"Z-Score: {df['z_score'].iloc[-1]:.4f}")
+            print(f"RSI: {df['rsi_smoothed'].iloc[-1]:.2f}")
+            print(f"Spread: {df['spread'].iloc[-1]:.6f}")
+    
+    else:
+        print("Invalid choice")
+
+if __name__ == "__main__":
+    main()
